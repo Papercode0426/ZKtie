@@ -112,3 +112,4 @@ node test.js
 
 - Input bits use **big-endian** byte order (MSB first per byte), matching SHA256's internal representation.
 - `genProof` time is dominated by MSM operations; `verifyProof` is fast (constant-time pairings).
+- zkTieProof.py is used to generate and verify the combination of ECDSA and Shnorr.
