@@ -1,0 +1,189 @@
+pragma circom 2.0.2;
+
+include "../node_modules/circomlib/circuits/bitify.circom";
+include "../node_modules/circomlib/circuits/sha256/sha256.circom";
+include "../node_modules/circomlib/circuits/multiplexer.circom";
+include "../node_modules/circomlib/circuits/gates.circom";
+include "lib/bigint.circom";
+include "lib/secp256k1.circom";
+
+// 把 8 个 32-bit little-endian limb 的数转成 32 个字节（大端），
+// 输出每个字节的 8 个 bit（MSB-first）。SHA256 输入用。
+template RegsToBytesBE() {
+    signal input in[8];
+    signal output out[256];
+    component b2n[8];
+    for (var i = 0; i < 8; i++) {
+        b2n[i] = Num2Bits(32);
+        b2n[i].in <== in[i];
+    }
+    // limb i 覆盖 bit [32i, 32i+31]（LE）。字节大端 = 从最高 limb 的最高字节开始。
+    // out[0..255] 为 32 字节的 MSB-first bits。
+    for (var i = 0; i < 8; i++) {
+        var reg = 7 - i;   // 从高到低
+        for (var byteIdx = 0; byteIdx < 4; byteIdx++) {
+            var bitInReg = 31 - byteIdx * 8;
+            for (var b = 0; b < 8; b++) {
+                out[(i * 4 + byteIdx) * 8 + b] <== b2n[reg].out[bitInReg - b];
+            }
+        }
+    }
+}
+
+// 从 s1（8 个 32-bit limb）提取 32 个 8-bit 窗口
+template WindowSelector() {
+    signal input s1[8];
+    signal output sel[32];
+    component n2b[8];
+    component b2n[32];
+    for (var i = 0; i < 8; i++) {
+        n2b[i] = Num2Bits(32);
+        n2b[i].in <== s1[i];
+    }
+    for (var w = 0; w < 32; w++) {
+        var limb = w \ 4;
+        var off = (w % 4) * 8;
+        b2n[w] = Bits2Num(8);
+        for (var j = 0; j < 8; j++) b2n[w].in[j] <== n2b[limb].out[off + j];
+        sel[w] <== b2n[w].out;
+    }
+}
+
+// 主电路：验证
+//   1. r1^s1 = rhs（secp256k1 标量乘，windowed，公开 table）
+//   2. h = SHA256(r1.x || r1.y || s1)
+//
+// public : r1, table[32][256][2][8], rhs, h
+// witness: s1, partial[32][2][8]（JS 提供的累加中间点）
+template EcdsaVerify() {
+    signal input r1[2][8];
+    signal input table[32][256][2][8];
+    signal input rhs[2][8];
+    signal input h[8];
+    signal input s1[8];
+    signal input partial[32][2][8];
+    signal input addout[32][2][8];
+    signal input p[8];
+
+    // ---- 窗口选择 ----
+    component selc = WindowSelector();
+    for (var i = 0; i < 8; i++) selc.s1[i] <== s1[i];
+
+    // ---- 每窗口用 Multiplexer 从公开 table 选点 ----
+    component mux[32][2];
+    for (var w = 0; w < 32; w++) {
+        for (var l = 0; l < 2; l++) {
+            mux[w][l] = Multiplexer(8, 256);
+            mux[w][l].sel <== selc.sel[w];
+            for (var j = 0; j < 256; j++)
+                for (var i = 0; i < 8; i++)
+                    mux[w][l].inp[j][i] <== table[w][j][l][i];
+        }
+    }
+
+    // ---- iszero / has_prev_nonzero ----
+    component iszero[32];
+    for (var w = 0; w < 32; w++) {
+        iszero[w] = IsZero();
+        iszero[w].in <== selc.sel[w];
+    }
+    component hpn[32];
+    hpn[0] = OR();
+    hpn[0].a <== 0;
+    hpn[0].b <== 1 - iszero[0].out;
+    for (var w = 1; w < 32; w++) {
+        hpn[w] = OR();
+        hpn[w].a <== hpn[w - 1].out;
+        hpn[w].b <== 1 - iszero[w].out;
+    }
+
+    // ---- partial[0] == selected[0] ----
+    component p0eq[2];
+    for (var l = 0; l < 2; l++) {
+        p0eq[l] = BigEq(8);
+        for (var i = 0; i < 8; i++) {
+            p0eq[l].in[0][i] <== partial[0][l][i];
+            p0eq[l].in[1][i] <== mux[0][l].out[i];
+        }
+    }
+    p0eq[0].out * p0eq[1].out === 1;
+
+    // ---- 累加：AddUnequal 验证 addout[w] = partial[w-1] + selected[w] ----
+    // partial[w] 由选择逻辑确定（处理 dummy / 未开始 / 窗口为 0 的情况）
+    signal hpn_isz[32];
+    signal hpn_nisz[32];
+    signal nhpn[32];
+    signal p_t1[32][2][8];
+    signal p_t2[32][2][8];
+    signal p_t3[32][2][8];
+    component adds[31];
+    for (var w = 1; w < 32; w++) {
+        hpn_isz[w] <== hpn[w - 1].out * iszero[w].out;
+        hpn_nisz[w] <== hpn[w - 1].out * (1 - iszero[w].out);
+        nhpn[w] <== 1 - hpn[w - 1].out;
+        adds[w - 1] = AddUnequal();
+        for (var i = 0; i < 8; i++) {
+            adds[w - 1].a[0][i] <== partial[w - 1][0][i];
+            adds[w - 1].a[1][i] <== partial[w - 1][1][i];
+            adds[w - 1].b[0][i] <== mux[w][0].out[i];
+            adds[w - 1].b[1][i] <== mux[w][1].out[i];
+            adds[w - 1].out[0][i] <== addout[w][0][i];
+            adds[w - 1].out[1][i] <== addout[w][1][i];
+            adds[w - 1].p[i] <== p[i];
+        }
+        // 线性化：每个乘积用独立 <== 约束（二次）
+        for (var l = 0; l < 2; l++) {
+            for (var i = 0; i < 8; i++) {
+                p_t1[w][l][i] <== hpn_isz[w] * partial[w - 1][l][i];
+                p_t2[w][l][i] <== hpn_nisz[w] * addout[w][l][i];
+                p_t3[w][l][i] <== nhpn[w] * mux[w][l].out[i];
+                partial[w][l][i] === p_t1[w][l][i] + p_t2[w][l][i] + p_t3[w][l][i];
+            }
+        }
+    }
+
+    // ---- 最终结果 == rhs ----
+    component r0 = BigEq(8);
+    component r1eq = BigEq(8);
+    for (var i = 0; i < 8; i++) {
+        r0.in[0][i] <== partial[31][0][i];
+        r0.in[1][i] <== rhs[0][i];
+        r1eq.in[0][i] <== partial[31][1][i];
+        r1eq.in[1][i] <== rhs[1][i];
+    }
+    r0.out * r1eq.out === 1;
+
+    // ---- r1 必须在曲线上 ----
+    component r1curve = PointOnCurve();
+    for (var i = 0; i < 8; i++) { r1curve.x[i] <== r1[0][i]; r1curve.y[i] <== r1[1][i]; r1curve.p[i] <== p[i]; }
+
+    // ---- 约束2：h = SHA256(r1.x || r1.y || s1) ----
+    component bx = RegsToBytesBE();
+    component by = RegsToBytesBE();
+    component bs = RegsToBytesBE();
+    for (var i = 0; i < 8; i++) {
+        bx.in[i] <== r1[0][i];
+        by.in[i] <== r1[1][i];
+        bs.in[i] <== s1[i];
+    }
+    component sha = Sha256(768);
+    for (var i = 0; i < 256; i++) {
+        sha.in[i] <== bx.out[i];
+        sha.in[256 + i] <== by.out[i];
+        sha.in[512 + i] <== bs.out[i];
+    }
+    // 比较 sha.out（256 bit MSB-first）与 h（8 个 32-bit LE limb）
+    component hb[8];
+    for (var i = 0; i < 8; i++) {
+        hb[i] = Num2Bits(32);
+        hb[i].in <== h[i];
+    }
+    for (var i = 0; i < 8; i++) {
+        var reg = 7 - i;
+        for (var j = 0; j < 32; j++) {
+            sha.out[i * 32 + j] === hb[reg].out[31 - j];
+        }
+    }
+}
+
+component main {public [r1, table, rhs, h]} = EcdsaVerify();
