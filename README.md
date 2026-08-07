@@ -55,6 +55,7 @@ npm install
 ## Compiling the circuit
 
 ```bash
+mkdir -p build
 npm run build
 # equivalent to:
 # circom circuits/verify.circom --r1cs --wasm --sym -o build
